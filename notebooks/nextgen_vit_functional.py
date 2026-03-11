@@ -7,9 +7,22 @@ simultaneously performs:
   - **Quark-Gluon Classification** (CrossEntropyLoss)
   - **Particle Mass Regression** (MSELoss)
 
-Architecture is inspired by:
-  - XCiT (arXiv:2106.09681): Cross-Covariance Image Transformer
-  - L2ViT: Local Concentration Module for linear attention
+Architecture implements **L2ViT** (arXiv:2501.16182):
+  "The Linear Attention Resurrection in Vision Transformer", Zheng 2025.
+
+Key contributions from the paper:
+  1. **ReLU-based linear attention** — φ(Q)(φ(K)ᵀV) / clamp(φ(Q)·Σφ(K), 1e2)
+     achieving O(N·C²) complexity while preserving the non-negative property.
+  2. **Local Concentration Module (LCM)** — two depth-wise convolutions
+     (DWConv₁ → GELU → BN → DWConv₂, kernel 7×7) that refocus the
+     dispersive linear-attention map on local neighbourhoods (paper Eq. 6-7,
+     Fig. 5).
+  3. **Linear Global Attention (LGA) block** — linear attention followed by
+     an LCM residual: Y = LCM(LN(X)) + X  (paper Eq. 8).
+  4. **Local Window Attention (LWA) block** — standard multi-head self-
+     attention restricted to non-overlapping w×w spatial windows.
+  5. **Alternating LGA + LWA** blocks so the model captures both global
+     patch-to-patch context and fine-grained local representations.
 
 Design principle: **purely functional** — no top-level Python ``class``
 definitions.  All components are ``nn.Sequential`` / ``nn.Module`` sub-graphs
@@ -35,6 +48,11 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 from einops import rearrange
 
+
+# Minimum value used to clamp the linear-attention denominator.
+# A value of 1e2 gives the best accuracy/stability trade-off per L2ViT
+# Appendix 8, Table 10 (values below 1e-1 cause NaN; gains plateau above 1e3).
+_DENOM_CLAMP_MIN: float = 1e2
 
 # ---------------------------------------------------------------------------
 # 1. Convolutional Stem
@@ -132,141 +150,295 @@ def build_cpe(embed_dim: int) -> nn.Module:
 # 3. Local Concentration Module (LCM)
 # ---------------------------------------------------------------------------
 
-def build_lcm(embed_dim: int) -> nn.Module:
+def build_lcm(embed_dim: int, kernel_size: int = 7) -> nn.Module:
     """Build the L2ViT Local Concentration Module (LCM).
 
-    Linear attention (XCA) computes a global context vector that is identical
-    for all tokens — the so-called "distribution concentration" problem.  The
-    LCM counteracts this by adding a depth-wise 3×3 convolution branch on top
-    of the Value (V) tensor.  This injects local spatial context that breaks
-    the uniformity.
+    Linear attention distributes attention scores uniformly over all patches,
+    losing the local concentration property of softmax attention (Fig. 1 of
+    L2ViT paper).  The LCM re-focuses the output by applying two depth-wise
+    convolutional layers that reinforce local spatial interactions.
 
-    Forward signature: ``lcm(v, H, W) → (B, N, C)``
+    Implementation exactly matches the reference code in L2ViT paper Fig. 5
+    and Eqs. 6-7::
+
+        X̂     = GELU( DWConv₁(Rearrange(X)) )       # (B, C, H, W)
+        X_LCM = Rearrange( DWConv₂( BN( X̂ ) ) )    # (B, N, C)
+
+    Applied as a residual in the LGA block (paper Eq. 8):
+        Y = LCM( LN(X) ) + X
+
+    The default kernel size is 7×7 (ablated as optimal in L2ViT Table 6).
+
+    Forward signature: ``lcm(x, H, W) → (B, N, C)``
 
     Args:
-        embed_dim: Channel dimension.
+        embed_dim: Channel dimension C.
+        kernel_size: Depth-wise conv kernel size (default 7 as in paper).
 
     Returns:
-        nn.Module implementing the local-context branch.
+        nn.Module implementing LCM.  Input/output shape: (B, N, C).
     """
 
     class _LCM(nn.Module):
-        """Local Concentration Module: depthwise conv on Value tokens."""
+        """Local Concentration Module (L2ViT paper Fig. 5)."""
 
-        def __init__(self, dim: int) -> None:
+        def __init__(self, dim: int, ks: int) -> None:
             super().__init__()
-            self.local_conv = nn.Sequential(
-                nn.Conv2d(dim, dim, kernel_size=3, padding=1,
-                          groups=dim, bias=False),  # depth-wise
-                nn.BatchNorm2d(dim),
-                nn.GELU(),
+            padding = ks // 2
+            # DWConv₁: depth-wise convolution
+            self.conv1 = nn.Conv2d(
+                dim, dim, kernel_size=ks, padding=padding, groups=dim
+            )
+            self.act = nn.GELU()
+            # Batch norm between the two convolutions
+            self.bn = nn.BatchNorm2d(dim)
+            # DWConv₂: second depth-wise convolution
+            self.conv2 = nn.Conv2d(
+                dim, dim, kernel_size=ks, padding=padding, groups=dim
             )
 
-        def forward(self, v: torch.Tensor, H: int, W: int) -> torch.Tensor:
-            # v: (B, N, C)
-            B, N, C = v.shape
-            v_spatial = rearrange(v, 'b (h w) c -> b c h w', h=H, w=W)
-            v_local = self.local_conv(v_spatial)
-            return rearrange(v_local, 'b c h w -> b (h w) c')
+        def forward(self, x: torch.Tensor, H: int, W: int) -> torch.Tensor:
+            # x: (B, N, C)  →  rearrange to (B, C, H, W) for conv ops
+            B, N, C = x.shape
+            x = x.transpose(-1, -2).contiguous().view(B, C, H, W)
+            x = self.conv1(x)   # DWConv₁
+            x = self.act(x)     # GELU  (Eq. 6)
+            x = self.bn(x)      # BN    (Eq. 7)
+            x = self.conv2(x)   # DWConv₂
+            # Reshape back to sequence: (B, C, H, W) → (B, N, C)
+            x = x.flatten(2).transpose(-1, -2)
+            return x
 
-    return _LCM(embed_dim)
+    return _LCM(embed_dim, kernel_size)
 
 
 # ---------------------------------------------------------------------------
-# 4. XCA Block (Cross-Covariance Attention + LCM)
+# 4. Linear Global Attention (LGA) Block
 # ---------------------------------------------------------------------------
 
-def build_xca_block(embed_dim: int, num_heads: int) -> nn.Module:
-    """Build an XCiT Cross-Covariance Attention block with the LCM attached.
+def build_lga_block(embed_dim: int,
+                    num_heads: int,
+                    lcm_kernel: int = 7) -> nn.Module:
+    """Build an L2ViT Linear Global Attention (LGA) block.
 
-    Standard self-attention is O(N²) in the sequence length N.  XCA instead
-    computes attention in the **channel** (head-dimension) space of size
-    d_head × d_head, giving O(N) complexity — critical for high-resolution
-    detector images.
+    The LGA block realises the two key ideas of the L2ViT paper:
 
-    The attention matrix is::
+    **1. ReLU-based linear attention** (Section 4.1, Eq. 3-4):
+    Using φ = ReLU as the kernel feature map guarantees that all entries of
+    the attention matrix are non-negative (matching the property of softmax)
+    while reducing complexity from O(N²C) to O(NC²) by multiplying K and V
+    first::
 
-        Attn = softmax( (Q̃ᵀ · K̃) / τ )
+        O = φ(Q) · (φ(K)ᵀ V · s) / clamp(φ(Q) · Σφ(K)ᵀ, min=1e2)
 
-    where Q̃ = L2-norm(Q) and K̃ = L2-norm(K) are normalised along the token
-    dimension (not the feature dimension).  The output is::
+    where s is a learnable scale parameter initialised at √C (per paper
+    Appendix 7) and the denominator is clamped to [1e2, +∞) for training
+    stability (paper Appendix 8, Table 10).
 
-        out = V · Attnᵀ   (shape: B, heads, N, d_head)
+    **2. Local Concentration Module (LCM)** applied as a residual on the
+    linear-attention output (Section 4.2, Eq. 8)::
 
-    then the LCM output is added before projecting back to embed_dim.
+        Y = LCM( LN(X) ) + X
 
-    L2 normalisation along the token dimension keeps the dot product bounded
-    regardless of sequence length, replacing the 1/√d scaling of vanilla
-    attention.
+    Full LGA block recipe (Fig. 3 right)::
 
-    Temperature τ is a learnable per-head scalar (initialised to 0.2) that
-    controls the sharpness of the attention distribution.
+        x = CPE(x)                              # conditional positional enc.
+        la_out = LA( LN₁(x) )                  # ReLU linear attention
+        y = LCM( LN₂(la_out) ) + la_out        # LCM residual  (Eq. 8)
+        x = x + y                               # main skip connection
+        x = x + FFN( LN₃(x) )                  # feed-forward sub-block
 
     Args:
-        embed_dim: Total channel dimension.
+        embed_dim: Token feature dimension C.
         num_heads: Number of attention heads.
+        lcm_kernel: Kernel size for LCM depth-wise convolutions (default 7).
 
     Returns:
-        nn.Module implementing XCA + LCM with learned temperature and output
-        projection.
+        nn.Module whose forward signature is ``(x, H, W) -> x``.
     """
-    assert embed_dim % num_heads == 0, \
+    assert embed_dim % num_heads == 0, (
         f"embed_dim ({embed_dim}) must be divisible by num_heads ({num_heads})"
+    )
 
-    class _XCABlock(nn.Module):
-        """XCiT Cross-Covariance Attention with Local Concentration Module."""
+    class _LGABlock(nn.Module):
+        """L2ViT Linear Global Attention block (ReLU-LA + LCM + FFN)."""
 
-        def __init__(self, dim: int, heads: int) -> None:
+        def __init__(self, dim: int, heads: int, ks: int) -> None:
             super().__init__()
             self.heads = heads
             self.d_head = dim // heads
-            # Project input to Q, K, V
+
+            # --- Linear attention components ---
+            # Q, K, V projections
             self.qkv = nn.Linear(dim, 3 * dim, bias=False)
             # Output projection
             self.proj = nn.Linear(dim, dim)
-            # Learnable temperature (one per head)
-            # Small initial value makes attention more uniform at start
-            self.temperature = nn.Parameter(
-                torch.ones(heads, 1, 1) * 0.2
+            # Learnable scale parameter s, initialised to √C (paper App. 7).
+            # The paper does not specify per-head scaling; a single shared
+            # scalar is sufficient and keeps the implementation clean.
+            self.scale = nn.Parameter(
+                torch.full((1,), math.sqrt(dim))
             )
-            # Local Concentration Module (L2ViT)
-            self.lcm = build_lcm(dim)
 
-        def forward(self, x: torch.Tensor, H: int, W: int) -> torch.Tensor:
+            # --- LCM components (Eq. 8) ---
+            self.lcm = build_lcm(dim, kernel_size=ks)
+            self.ln_lcm = nn.LayerNorm(dim)  # LN before LCM (Eq. 8)
+
+            # --- Block norms ---
+            self.ln1 = nn.LayerNorm(dim)   # before linear attention
+            self.ln2 = nn.LayerNorm(dim)   # before FFN (accessed by _Block)
+
+        def _linear_attention(
+            self, x: torch.Tensor
+        ) -> torch.Tensor:
+            """ReLU-based linear attention (L2ViT Eq. 3-4).
+
+            Complexity: O(N · C²) — key and value are multiplied first.
+            Denominator is clamped to [1e2, +∞) for stability (Table 10).
+            """
             B, N, C = x.shape
-            # Compute Q, K, V  →  (B, N, 3*C)  →  3 × (B, N, C)
+            # Project to Q, K, V
             qkv = self.qkv(x)
             q, k, v = qkv.chunk(3, dim=-1)  # each (B, N, C)
 
-            # Reshape to multi-head: (B, heads, N, d_head)
+            # Multi-head reshape: (B, heads, N, d_head)
             q = rearrange(q, 'b n (h d) -> b h n d', h=self.heads)
             k = rearrange(k, 'b n (h d) -> b h n d', h=self.heads)
             v = rearrange(v, 'b n (h d) -> b h n d', h=self.heads)
 
-            # L2-normalise along the **token** dimension (dim=-2, i.e. N axis)
-            # This bounds the dot product and replaces the 1/√d scale factor.
-            q = F.normalize(q, p=2, dim=-2)
-            k = F.normalize(k, p=2, dim=-2)
+            # φ = ReLU — ensures non-negative attention values (Section 4.1)
+            q = F.relu(q)
+            k = F.relu(k)
 
-            # XCA: attention in channel (d_head) space
-            # Attn: (B, heads, d_head, d_head)
-            attn = torch.matmul(q.transpose(-2, -1), k) / self.temperature
-            attn = F.softmax(attn, dim=-1)
+            # φ(K)ᵀ V: shape (B, heads, d_head, d_head)  — O(N·C²) step
+            kv = torch.matmul(k.transpose(-2, -1), v) * self.scale
 
-            # Aggregate: (B, heads, N, d_head)
-            out = torch.matmul(v, attn.transpose(-2, -1))
+            # Denominator: φ(Q) · Σφ(K)ᵀ → (B, heads, N, 1)
+            # Σφ(K) = sum over N tokens → (B, heads, d_head)
+            k_sum = k.sum(dim=-2)  # (B, heads, d_head)
+            # dot product per token: (B, heads, N, d_head) × (B, heads, d_head, 1)
+            denom = torch.matmul(q, k_sum.unsqueeze(-1))  # (B, heads, N, 1)
+            # Clamp to [_DENOM_CLAMP_MIN, +∞) for training stability (Appendix 8)
+            denom = denom.clamp(min=_DENOM_CLAMP_MIN)
 
-            # Merge heads back to (B, N, C)
+            # Numerator: φ(Q) · (φ(K)ᵀ V) → (B, heads, N, d_head)
+            out = torch.matmul(q, kv) / denom  # (B, heads, N, d_head)
+
+            # Merge heads: (B, N, C)
             out = rearrange(out, 'b h n d -> b n (h d)')
-
-            # LCM: add local spatial context from V (in original token form)
-            v_seq = rearrange(v, 'b h n d -> b n (h d)')
-            out = out + self.lcm(v_seq, H, W)
-
-            # Final output projection
             return self.proj(out)
 
-    return _XCABlock(embed_dim, num_heads)
+        def forward(self, x: torch.Tensor, H: int, W: int) -> torch.Tensor:
+            # CPE is applied externally in the transformer block
+            # 1. ReLU linear attention (pre-norm)
+            la_out = self._linear_attention(self.ln1(x))
+
+            # 2. LCM residual: Y = LCM(LN(la_out)) + la_out  (Eq. 8)
+            y = self.lcm(self.ln_lcm(la_out), H, W) + la_out
+
+            # 3. Main skip connection
+            return x + y
+
+    return _LGABlock(embed_dim, num_heads, lcm_kernel)
+
+
+# ---------------------------------------------------------------------------
+# 4b. Local Window Attention (LWA) Block
+# ---------------------------------------------------------------------------
+
+def build_lwa_block(embed_dim: int,
+                    num_heads: int,
+                    window_size: int = 4) -> nn.Module:
+    """Build an L2ViT Local Window Attention (LWA) block.
+
+    The LWA block applies standard multi-head self-attention within
+    non-overlapping spatial windows (Swin-style, L2ViT Fig. 3 left).
+    Window attention introduces locality and translational invariance that
+    complement the global context captured by the LGA block.
+
+    LWA block recipe (Fig. 3 left)::
+
+        x = CPE(x)                           # conditional positional enc.
+        x = x + WA( LN₁(x) )               # window attention + residual
+        x = x + FFN( LN₂(x) )              # feed-forward sub-block
+
+    Args:
+        embed_dim: Token feature dimension C.
+        num_heads: Number of attention heads.
+        window_size: Side length w of each square attention window.
+            If H or W is not divisible by w the feature map is padded.
+
+    Returns:
+        nn.Module whose forward signature is ``(x, H, W) -> x``.
+    """
+    assert embed_dim % num_heads == 0, (
+        f"embed_dim ({embed_dim}) must be divisible by num_heads ({num_heads})"
+    )
+
+    class _LWABlock(nn.Module):
+        """L2ViT Local Window Attention block."""
+
+        def __init__(self, dim: int, heads: int, ws: int) -> None:
+            super().__init__()
+            self.heads = heads
+            self.ws = ws
+            self.scale = (dim // heads) ** -0.5
+            self.qkv = nn.Linear(dim, 3 * dim, bias=False)
+            self.proj = nn.Linear(dim, dim)
+            self.ln1 = nn.LayerNorm(dim)
+            self.ln2 = nn.LayerNorm(dim)   # before FFN (accessed by _Block)
+
+        def _window_attention(
+            self, x: torch.Tensor, H: int, W: int
+        ) -> torch.Tensor:
+            """Multi-head self-attention inside non-overlapping w×w windows."""
+            B, N, C = x.shape
+            ws = self.ws
+
+            # Reshape tokens to 2-D spatial map: (B, H, W, C)
+            x2d = x.view(B, H, W, C)
+
+            # Pad to make H and W divisible by ws
+            pad_h = (ws - H % ws) % ws
+            pad_w = (ws - W % ws) % ws
+            if pad_h > 0 or pad_w > 0:
+                x2d = F.pad(x2d, (0, 0, 0, pad_w, 0, pad_h))
+            Hp, Wp = H + pad_h, W + pad_w
+
+            # Partition into windows: (num_windows * B, ws, ws, C)
+            nH, nW = Hp // ws, Wp // ws
+            x_win = x2d.view(B, nH, ws, nW, ws, C)
+            x_win = x_win.permute(0, 1, 3, 2, 4, 5).contiguous()
+            x_win = x_win.view(-1, ws * ws, C)   # (B*nH*nW, ws²,  C)
+
+            # Standard multi-head self-attention within each window
+            Bw = x_win.shape[0]
+            qkv = self.qkv(x_win)
+            q, k, v = qkv.chunk(3, dim=-1)
+            q = rearrange(q, 'b n (h d) -> b h n d', h=self.heads)
+            k = rearrange(k, 'b n (h d) -> b h n d', h=self.heads)
+            v = rearrange(v, 'b n (h d) -> b h n d', h=self.heads)
+
+            attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+            attn = F.softmax(attn, dim=-1)
+            out = torch.matmul(attn, v)                  # (Bw, heads, ws², d)
+            out = rearrange(out, 'b h n d -> b n (h d)')  # (Bw, ws², C)
+            out = self.proj(out)
+
+            # Reverse windowing: back to (B, H, W, C)
+            out = out.view(B, nH, nW, ws, ws, C)
+            out = out.permute(0, 1, 3, 2, 4, 5).contiguous()
+            out = out.view(B, Hp, Wp, C)
+            # Remove padding
+            out = out[:, :H, :W, :].contiguous()
+            return out.view(B, H * W, C)
+
+        def forward(self, x: torch.Tensor, H: int, W: int) -> torch.Tensor:
+            # CPE is applied externally in the transformer block
+            # Window attention (pre-norm + residual)
+            return x + self._window_attention(self.ln1(x), H, W)
+
+    return _LWABlock(embed_dim, num_heads, window_size)
 
 
 # ---------------------------------------------------------------------------
@@ -305,50 +477,71 @@ def build_ffn(embed_dim: int,
 
 def build_transformer_block(embed_dim: int,
                              num_heads: int,
+                             block_type: str = 'lga',
                              mlp_ratio: float = 4.0,
-                             drop_rate: float = 0.1) -> nn.Module:
-    """Build one complete transformer block.
+                             drop_rate: float = 0.1,
+                             lcm_kernel: int = 7,
+                             window_size: int = 4) -> nn.Module:
+    """Build one complete L2ViT transformer block (LGA or LWA).
 
-    Each block follows the pre-norm recipe::
+    Both block types share the same outer structure (CPE + attention
+    sub-block + FFN) but differ in the attention mechanism:
 
-        x = CPE(x)                             # conditional positional encoding
-        x = x + XCA(LN(x))                    # attention sub-block (residual)
-        x = x + FFN(LN(x))                    # feed-forward sub-block (residual)
+    * **LGA** (Linear Global Attention, default):
+        CPE → ReLU-LA + LCM residual → FFN
+    * **LWA** (Local Window Attention):
+        CPE → Window self-attention → FFN
+
+    Pre-norm recipe is used throughout::
+
+        x = CPE(x)
+        x = x + attention_sublayer( LN₁(x) )    [handled inside LGA/LWA]
+        x = x + FFN( LN₂(x) )
 
     Args:
         embed_dim: Token feature dimension.
         num_heads: Attention heads.
+        block_type: ``'lga'`` for Linear Global Attention or
+            ``'lwa'`` for Local Window Attention.
         mlp_ratio: FFN hidden-dim multiplier.
         drop_rate: Dropout probability.
+        lcm_kernel: LCM depth-wise conv kernel size (LGA only, default 7).
+        window_size: Window side length (LWA only, default 4).
 
     Returns:
-        nn.Module for one transformer block. Its forward signature is
-        ``(x, H, W) -> x`` where H, W are the spatial dimensions.
+        nn.Module for one transformer block. Forward signature:
+        ``(x, H, W) -> x``.
     """
     cpe = build_cpe(embed_dim)
-    xca = build_xca_block(embed_dim, num_heads)
     ffn = build_ffn(embed_dim, mlp_ratio, drop_rate)
-    ln1 = nn.LayerNorm(embed_dim)
-    ln2 = nn.LayerNorm(embed_dim)
+
+    if block_type == 'lga':
+        attn_block = build_lga_block(embed_dim, num_heads,
+                                     lcm_kernel=lcm_kernel)
+    elif block_type == 'lwa':
+        attn_block = build_lwa_block(embed_dim, num_heads,
+                                     window_size=window_size)
+    else:
+        raise ValueError(
+            f"block_type must be 'lga' or 'lwa', got '{block_type}'"
+        )
 
     class _Block(nn.Module):
-        """Single XCiT-style transformer block with CPE, XCA+LCM, and FFN."""
+        """Single L2ViT transformer block (LGA or LWA) with CPE and FFN."""
 
         def __init__(self) -> None:
             super().__init__()
             self.cpe = cpe
-            self.ln1 = ln1
-            self.xca = xca
-            self.ln2 = ln2
+            self.attn = attn_block
             self.ffn = ffn
 
         def forward(self, x: torch.Tensor, H: int, W: int) -> torch.Tensor:
             # 1. Conditional Positional Encoding
             x = self.cpe(x, H, W)
-            # 2. XCA attention sub-block (pre-norm + residual)
-            x = x + self.xca(self.ln1(x), H, W)
-            # 3. FFN sub-block (pre-norm + residual)
-            x = x + self.ffn(self.ln2(x))
+            # 2. Attention sub-block (LGA or LWA)
+            x = self.attn(x, H, W)
+            # 3. FFN sub-block (pre-norm + residual); ln2 lives in self.attn
+            x = x + self.ffn(self.attn.ln2(x))
             return x
 
     return _Block()
@@ -367,24 +560,28 @@ def build_nextgen_vit(
     num_heads: int = 4,
     mlp_ratio: float = 4.0,
     drop_rate: float = 0.1,
+    lcm_kernel: int = 7,
+    window_size: int = 4,
 ) -> nn.Module:
-    """Build the complete Next-Gen Vision Transformer for CMS jet images.
+    """Build the complete L2ViT-style model for CMS jet images.
 
-    The model is a single ``nn.Module`` backed by an ``nn.ModuleDict`` of
-    named sub-modules (no top-level class definition).  All components are
-    assembled from builder functions that return ``nn.Sequential`` /
-    ``nn.Module`` instances.
-
-    Architecture overview::
+    Implements the L2ViT architecture (arXiv:2501.16182) adapted for
+    particle-physics detector images.  Blocks alternate between LWA
+    (Local Window Attention) and LGA (Linear Global Attention) as described
+    in the paper (Section 4.3, Fig. 3): in each pair the LWA first models
+    fine-grained short-range interactions, then the LGA builds the global
+    patch-to-patch context::
 
         Input: (B, in_chans, img_size, img_size)
-            ↓  ConvStem  (3× stride-2)
+            ↓  ConvStem  (3× stride-2, 3 conv layers)
         Feature map: (B, embed_dim, H', W')
             ↓  Flatten to tokens: (B, H'*W', embed_dim)
-        ┌─────────────────────────────────────────┐
-        │  × depth  TransformerBlock               │
-        │     CPE → XCA+LCM → FFN                 │
-        └─────────────────────────────────────────┘
+        ┌──────────────────────────────────────────────────────────────┐
+        │  × (depth // 2)  paired blocks:                              │
+        │     [LWA] CPE → Window-Attn → FFN                           │
+        │     [LGA] CPE → ReLU-LinAttn + LCM residual → FFN           │
+        │  + (depth % 2) extra LGA block if depth is odd              │
+        └──────────────────────────────────────────────────────────────┘
             ↓  LayerNorm
             ↓  Global Average Pool  →  (B, embed_dim)
             ├─→ ClassHead  →  (B, num_classes)
@@ -395,10 +592,13 @@ def build_nextgen_vit(
         in_chans: Number of input channels (3: Tracker, ECAL, HCAL).
         num_classes: Number of classification labels (2: quark vs. gluon).
         embed_dim: Token embedding dimension.
-        depth: Number of stacked transformer blocks.
+        depth: Total number of transformer blocks.  Alternates LWA, LGA,
+            LWA, LGA, … so even values give perfectly paired blocks.
         num_heads: Number of attention heads.
         mlp_ratio: FFN hidden-dim expansion ratio.
         drop_rate: Dropout probability used in FFN.
+        lcm_kernel: Kernel size for LCM depth-wise convolutions (default 7).
+        window_size: Side length of LWA attention windows (default 4).
 
     Returns:
         nn.Module with a ``forward(x)`` method that returns a dict
@@ -411,9 +611,20 @@ def build_nextgen_vit(
 
     # --- Sub-module construction ---
     stem = build_conv_stem(in_chans, embed_dim)
+
+    # Alternate LWA (even indices 0,2,4,…) and LGA (odd indices 1,3,5,…)
+    # so that local window attention precedes global linear attention in each
+    # pair, matching the L2ViT design (paper Section 4.3).
     blocks = nn.ModuleList([
-        build_transformer_block(embed_dim, num_heads, mlp_ratio, drop_rate)
-        for _ in range(depth)
+        build_transformer_block(
+            embed_dim, num_heads,
+            block_type='lwa' if i % 2 == 0 else 'lga',
+            mlp_ratio=mlp_ratio,
+            drop_rate=drop_rate,
+            lcm_kernel=lcm_kernel,
+            window_size=window_size,
+        )
+        for i in range(depth)
     ])
     norm = nn.LayerNorm(embed_dim)
     cls_head = nn.Linear(embed_dim, num_classes)
@@ -430,7 +641,7 @@ def build_nextgen_vit(
 
     # --- Model wrapper (single internal class, not exported) ---
     class _NextGenViT(nn.Module):
-        """Next-Gen Vision Transformer — functional wrapper over ModuleDict."""
+        """L2ViT for CMS jet images — functional wrapper over ModuleDict."""
 
         def __init__(self, mods: nn.ModuleDict, h: int, w: int) -> None:
             super().__init__()
@@ -455,7 +666,7 @@ def build_nextgen_vit(
             # 2. Flatten spatial dims to token sequence
             tokens = rearrange(feat, 'b c h w -> b (h w) c')  # (B, N, C)
 
-            # 3. Transformer blocks (CPE + XCA+LCM + FFN)
+            # 3. Alternating LWA + LGA transformer blocks
             for blk in self.mods['blocks']:
                 tokens = blk(tokens, self.H, self.W)
 

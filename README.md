@@ -13,14 +13,19 @@ The model is based on **Cross-Covariance Attention (XCA)** from the XCiT archite
 
 ## Architecture
 
+The model implements **L2ViT** (arXiv:2501.16182) — *"The Linear Attention Resurrection in Vision Transformer"* — adapted for CMS 125×125 jet images.
+
 | Component | Description |
 |-----------|-------------|
-| **Patch Embedding** | Conv2D projection of non-overlapping image patches |
-| **Cross-Covariance Attention (XCA)** | Linear-complexity attention over feature channels |
-| **Local Patch Interaction (LPI)** | Depth-wise convolutions for local spatial structure |
-| **Transformer Encoder** | Stacked XCiT blocks with residual connections |
+| **Convolutional Stem** | Three stride-2 Conv2D layers reducing 125×125 → 16×16 tokens |
+| **Conditional Positional Encoding (CPE)** | Depth-wise 3×3 conv residual for resolution-agnostic position |
+| **ReLU-based Linear Attention (LA)** | φ(Q)(φ(K)ᵀV)·s / clamp(φ(Q)·Σφ(K), 1e2), φ=ReLU — O(N·C²) |
+| **Local Concentration Module (LCM)** | DWConv₁(7×7)→GELU→BN→DWConv₂(7×7) applied as residual Y=LCM(LN(X))+X |
+| **Linear Global Attention (LGA) block** | CPE → ReLU-LA + LCM residual → FFN |
+| **Local Window Attention (LWA) block** | CPE → window self-attention (4×4) → FFN |
+| **Alternating LGA + LWA** | LWA first captures local features, LGA builds global context |
 | **Regression Head** | MLP predicting normalized particle mass |
-| **Classification Head** | MLP predicting particle class logits |
+| **Classification Head** | MLP predicting particle class logits (quark vs. gluon) |
 
 ## Training Pipeline
 
@@ -65,8 +70,8 @@ pip install -r requirements.txt
 
 ## References
 
+- **L2ViT**: Zheng, "The Linear Attention Resurrection in Vision Transformer", arXiv:2501.16182, 2025
 - **XCiT**: El-Nouby et al., "XCiT: Cross-Covariance Image Transformers", NeurIPS 2021
-- **L2ViT**: Zheng, "Linear attention vision transformers"
 - **MAE**: He et al., "Masked Autoencoders Are Scalable Vision Learners", CVPR 2022
 - **ViT**: Dosovitskiy et al., "An Image is Worth 16x16 Words", ICLR 2021
 
