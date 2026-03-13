@@ -9,7 +9,7 @@ This repository provides a **comprehensive research pipeline** for particle coll
 1. **Self-supervised pretraining** — masked image modeling on unlabeled detector data
 2. **Multi-task fine-tuning** — particle classification + mass regression with uncertainty weighting
 3. **Pretrained vs. scratch comparison** — demonstrating the benefit of self-supervised pretraining
-4. **Five-model benchmark** — comprehensive comparison across architectures and training strategies
+4. **Four-architecture benchmark** — StandardViT, LinearAttentionViT, L2ViT, XCiTViT
 
 ## Experimental Pipeline
 
@@ -20,13 +20,13 @@ Dataset_Specific_Unlabelled.h5
 Step 1 ─ Self-Supervised Pretraining (MAE / MAE v2 / SimMIM)
          │  pretrained encoder weights saved
          ▼
-Step 2 ─ Fine-tune Pretrained LinearAttentionViT
+Step 2 ─ Fine-tune Pretrained XCiTViT
          │  uncertainty-weighted multi-task loss (Kendall et al.)
          ▼
-Step 3 ─ Train LinearAttentionViT from Scratch
+Step 3 ─ Train XCiTViT from Scratch
          │  same architecture, same loss, no pretrained weights
          ▼
-Step 4 ─ Train Standard ViT & Hybrid CNN+ViT (standard CE+MSE loss)
+Step 4 ─ Train Standard ViT, Linear Attention ViT, and L2ViT (standard CE+MSE loss)
          ▼
 Final ─  5-Model Benchmark Comparison Table
 ```
@@ -42,29 +42,57 @@ Final ─  5-Model Benchmark Comparison Table
 | **Attention** | Standard multi-head softmax: `Softmax(QKᵀ/√d)·V` |
 | **Blocks** | Pre-norm: `x = x + Attn(LN(x)); x = x + FFN(LN(x))` |
 | **Stochastic Depth** | Linear decay 0→0.1 over DEPTH=10 blocks |
+| **Complexity** | O(N²·d) — quadratic in number of tokens |
 
-### Linear Attention Vision Transformer (XCA-based + Modern Techniques)
+### Linear Attention Vision Transformer (ReLU kernel)
+
+| Component | Description |
+|-----------|-------------|
+| **LinearAttention** | ReLU kernel feature maps: φ(Q)=ReLU(Q), φ(K)=ReLU(K) |
+| **Formula** | φ(Q)(φ(K)ᵀV) / (φ(Q)(φ(K)ᵀ1)) |
+| **Blocks** | Pre-norm: `x = x + Attn(LN(x)); x = x + FFN(LN(x))` |
+| **Complexity** | O(N·d²) — linear in number of tokens |
+
+### L2ViT — Linear Global Attention + Local Window Attention
+
+| Component | Description |
+|-----------|-------------|
+| **LinearGlobalAttention (LGA)** | ReLU kernel linear attention for global context |
+| **LocalWindowAttention (LWA)** | Standard softmax attention within non-overlapping windows |
+| **LocalConcentrationModule (LCM)** | Depth-wise convolutions to refocus dispersive linear attention |
+| **ConditionalPositionalEncoding** | Depth-wise 3×3 convolution for position encoding |
+| **Alternating Pattern** | LWA → LGA → LWA → LGA → ... |
+| **Complexity** | O(N·d²) global + O(w²·d) local per layer |
+
+### XCiT Vision Transformer (Cross-Covariance Attention)
 
 | Component | Description |
 |-----------|-------------|
 | **CrossCovarianceAttention** | L2-normalise Q,K along token dim → d×d attention matrix, learnable temperature |
 | **LocalPatchInteraction (LPI)** | Two depth-wise 3×3 convs with BatchNorm + GELU |
-| **RoPE** | Rotary Positional Embeddings applied to Q and K in XCA |
-| **Relative Position Bias** | Learnable bias table added to attention logits |
 | **LayerScale** | CaiT-style per-channel scaling (init=1e-4) after each residual |
-| **Token Pruning** | Score-based token removal for efficient inference |
 | **XCiT Block** | `x = x + LayerScale(XCA(LN(x))); x = x + LayerScale(LPI(LN(x))); x = x + LayerScale(FFN(LN(x)))` |
 | **Complexity** | O(N·d²) — linear in number of tokens |
 
-### Hybrid CNN + Vision Transformer
+## Physics-Inspired Preprocessing
 
-| Component | Description |
-|-----------|-------------|
-| **CNN Block 1** | IN_CHANS → 64 channels, MaxPool2d(2): 64→32 spatial |
-| **CNN Block 2** | 64 → 128 channels, MaxPool2d(2): 32→16 spatial |
-| **CNN Block 3** | 128 → EMBED_DIM channels, MaxPool2d(2): 16→8 spatial |
-| **Transformer** | DEPTH//2 standard ViT blocks on 8×8=64 tokens |
-| **Benefit** | CNN inductive biases + global transformer context |
+| Step | Transform | Purpose |
+|------|-----------|---------|
+| 1 | `x = log1p(x.clamp(min=0))` | Log energy compression |
+| 2 | `x[x < 1e-3] = 0` | Detector noise suppression |
+| 3 | `x = x / (x.sum() + 1e-8)` | Per-event energy normalization |
+| 4 | `x = (x - mean) / (std + 1e-6)` | Standardization |
+| 5 | Resize to (img_size, img_size) | Spatial normalization |
+
+## Data Augmentation
+
+Physics-aware augmentations applied during training:
+
+- **Rotation symmetry**: `torch.rot90(x, k, dims=[-2,-1])`
+- **Horizontal / vertical flips**
+- **Gaussian detector noise**: `x + randn_like(x) * 0.01`
+- **Energy scaling**: `x * Uniform(0.9, 1.1)`
+- **Dead pixel simulation**: `x * (rand_like(x) > 0.02)`
 
 ## Self-Supervised Pretraining Approaches
 
@@ -74,7 +102,7 @@ Three masked image modeling methods are implemented:
 *He et al., CVPR 2022*
 
 - Mask random patches (mask_ratio = 0.50)
-- Encode **visible** patches only with the LinearAttentionViT encoder
+- Encode **visible** patches only with the XCiTViT encoder
 - Decode to reconstruct masked patch pixel values via lightweight transformer decoder
 - Loss: MSE on masked pixels
 
@@ -140,30 +168,44 @@ TRAIN_FRAC = 0.80   # 80/20 split
 
 All finetuning models are trained with:
 - **Optimizer**: AdamW (lr=3e-4, weight_decay=1e-4)
-- **Scheduler**: CosineAnnealingLR
+- **Scheduler**: CosineAnnealingLR with linear warmup
 - **Mixed Precision**: `torch.cuda.amp` (automatic fallback on CPU/MPS)
 - **Gradient Clipping**: max_norm=1.0
-- **Early Stopping**: patience=5, monitors val MSE
-- **Checkpointing**: saves best state_dict by val MSE
+- **Early Stopping**: patience=5, monitors val loss/MSE
+- **Checkpointing**: saves best state_dict
+- **Mass Normalization**: regression targets normalized to zero mean, unit std
 
 ## Evaluation Metrics
 
 - **Classification**: Accuracy, F1 (macro), Precision, Recall, Confusion Matrix
 - **Regression**: MSE, MAE, R² (coefficient of determination)
-- **System**: Training time (s), peak GPU memory (MB), parameter count
+- **System**: Training time (s), inference speed (ms/sample), peak GPU memory (MB), parameter count
 
 ## Benchmark Comparison Output
 
 The final benchmark shows all 5 training runs:
 
 ```
-| Model                   | Accuracy | F1    | MSE   | MAE   | R²    | Train Time (s) | Parameters |
-|-------------------------|----------|-------|-------|-------|-------|----------------|------------|
-| Standard ViT            |          |       |       |       |       |                |            |
-| Linear Attention ViT    |          |       |       |       |       |                |            |
-| Hybrid CNN+ViT          |          |       |       |       |       |                |            |
-| Linear ViT (pretrained) |          |       |       |       |       |                |            |
-| Linear ViT (scratch)    |          |       |       |       |       |                |            |
+| Model                   | Accuracy | F1    | MSE   | MAE   | R²    | Train Time | Inference (ms) | GPU Mem (MB) | Parameters |
+|-------------------------|----------|-------|-------|-------|-------|------------|----------------|--------------|------------|
+| Standard ViT            |          |       |       |       |       |            |                |              |            |
+| Linear Attention ViT    |          |       |       |       |       |            |                |              |            |
+| L2ViT                   |          |       |       |       |       |            |                |              |            |
+| XCiT ViT (pretrained)   |          |       |       |       |       |            |                |              |            |
+| XCiT ViT (scratch)      |          |       |       |       |       |            |                |              |            |
+```
+
+## Model Saving
+
+Trained weights are saved to the `models/` directory:
+
+```
+models/
+    vit.pt              # Standard ViT
+    linear_vit.pt       # Linear Attention ViT
+    l2vit.pt            # L2ViT
+    xcit.pt             # XCiT ViT (pretrained)
+    pretrained_encoder.pt  # SimMIM pretrained encoder
 ```
 
 With visualizations: overlaid training curves, mass scatter plots per model, confusion matrices, and bar charts comparing key metrics across all 5 models.
@@ -187,8 +229,9 @@ pip install -r requirements.txt
 
 ```
 ├── notebooks/
-│   ├── linear_attention_vit.ipynb     # 15-section research notebook
+│   ├── linear_attention_vit.ipynb     # 16-section research notebook
 │   └── nextgen_vit_functional.py      # L2ViT functional implementation
+├── models/                            # Saved model weights (.pt files)
 ├── images/                            # Architecture diagrams
 ├── papers/                            # Reference research papers
 ├── requirements.txt                   # Python dependencies
@@ -202,19 +245,20 @@ pip install -r requirements.txt
 |---------|---------|
 | 1. Configuration | All hyperparameters, device detection, seeds |
 | 2. Dataset Loading | LazyHDF5Dataset (labeled + unlabeled), inspect_hdf5(), synthetic fallback |
-| 3. Preprocessing | Log-compress, resize to 64×64, 8-channel, augmentations |
-| 4. Model Architectures | StandardViT, LinearAttentionViT (with RoPE, LayerScale, Token Pruning, Rel. Pos. Bias), HybridCNNViT |
+| 3. Preprocessing | Log-compress, noise suppression, energy normalization, standardization, augmentations |
+| 4. Model Architectures | StandardViT, LinearAttentionViT (ReLU kernel), L2ViT (LGA+LWA), XCiTViT (Cross-Covariance) |
 | 5. Pretraining Models | MAEPretrainer, MAEv2Pretrainer, SimMIMPretrainer |
-| 6. Training Utilities | train_epoch (AMP), UncertaintyWeightedLoss, run_experiment(), run_experiment_uw(), EarlyStopping |
+| 6. Training Utilities | train_epoch (AMP), CosineWarmupScheduler, UncertaintyWeightedLoss, run_experiment(), run_experiment_uw(), EarlyStopping |
 | 7. Evaluation Metrics | Accuracy, F1, Precision, Recall, MSE, MAE, R² |
 | 8. Visualization Tools | Loss curves, scatter, confusion matrix, attention maps, comparison plots |
-| 9. Experiment 1: Pretrain | Self-supervised pretraining on unlabeled data (SimMIM), save encoder |
-| 10. Experiment 2: Finetune | Fine-tune pretrained encoder with uncertainty-weighted loss |
-| 11. Experiment 3: Scratch | Train LinearAttentionViT from scratch (standard + uncertainty-weighted) |
-| 12. Experiment 4: Std ViT | Train Standard ViT with standard loss |
-| 13. Experiment 5: Hybrid | Train Hybrid CNN+ViT with standard loss |
-| 14. Benchmark Comparison | 5-model comparison table + all visualizations |
-| 15. Final Results | Summary, best-per-metric analysis, pretraining benefit quantification |
+| 9. Self-Supervised Pretrain | Pretraining on unlabeled data (SimMIM), save encoder |
+| 10. Fine-tune XCiTViT | Fine-tune pretrained encoder with uncertainty-weighted loss |
+| 11. Scratch XCiTViT | Train XCiTViT from scratch for comparison |
+| 12. Standard ViT | Train Standard ViT with standard CE+MSE loss |
+| 13. Linear Attention ViT | Train Linear Attention ViT with standard loss |
+| 14. L2ViT | Train L2ViT with standard loss |
+| 15. Benchmark Comparison | Model comparison table + model saving + all visualizations |
+| 16. Final Results | Summary, best-per-metric analysis, pretraining benefit quantification |
 
 ## References
 
