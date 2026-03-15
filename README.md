@@ -158,7 +158,7 @@ MLP_RATIO = 4.0     # FFN expansion ratio
 DROPOUT = 0.1
 
 BATCH_SIZE = 32
-EPOCHS = 20
+EPOCHS = 35
 LR = 3e-4           # AdamW learning rate
 WEIGHT_DECAY = 1e-4
 TRAIN_FRAC = 0.80   # 80/20 split
